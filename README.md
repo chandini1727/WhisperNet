@@ -1,7 +1,6 @@
 # WhisperNet
 
 WhisperNet is a powerful and lightweight audio processing system built on top of OpenAI's Whisper model. It enables real-time speech-to-text transcription, voice command recognition, and AI-driven audio analysis in edge and cloud environments.
-
 ## 🚀 Features
 
 - 🔊 Real-time speech-to-text conversion using Whisper
