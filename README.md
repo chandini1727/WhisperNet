@@ -1,171 +1,146 @@
-# RFC: Internal JWT Minting for Agent Auto-Resume
+## Definition of DRA (Dynamic Resource Allocation)
 
-Status: Draft
+**Dynamic Resource Allocation (DRA)** is a Kubernetes feature that allows applications to request GPUs by specifying their exact hardware requirements—such as GPU model name and VRAM memory size—instead of just asking for a simple number like "1 GPU".
 
-## Summary
+In traditional Kubernetes setups, GPUs were treated as plain numbers (`nvidia.com/gpu: 1`), with no visibility into a card's actual model or memory size. In contrast, DRA treats every physical GPU as an individual device with its own detailed profile (model name, VRAM capacity, PCIe address, and health status).
 
-**Agent auto-resume** is the mechanism that wakes a paused agent sandbox when a user attempts to connect to it. This RFC proposes how this will work natively for **interactive CLI and SSH sessions**: when a user executes a command, the system reads their authentication token, checks the Sandbox Custom Resource for the `agent-id` label, and explicitly resumes the agent on their behalf. 
+To manage devices cleanly, DRA divides the workflow into three steps:
+1. **Hardware Inventory (`ResourceSlice`):** Worker nodes publish an exact list of the physical GPUs they have in stock.
+2. **Workload Requests (`ResourceClaim`):** Pods specify the exact hardware they need using search filters written in Common Expression Language (CEL).
+3. **Container Attachment (CDI):** Once Kubernetes matches a pod to a GPU, it uses the Container Device Interface (CDI) to safely attach that specific card into the container.
 
-Auto-resuming via **Web UI sessions** presents a different challenge. Browsers rely on session cookies. When a request comes in, the edge auth service validates and strips the cookie before routing traffic to the internal `sandbox-activator`. 
+---
 
-When the `sandbox-activator` receives traffic for a paused agent, it must forward a Resume request to the Control Plane (CP). The CP needs to authenticate this request. However, because the cookie was already stripped at the edge, the activator has no identity context to send to the CP. Without this, the CP cannot authenticate *who* is attempting to wake the agent, and because the CP only authenticates API Keys and JWTs (enforced via `pkg/middleware`), it rejects the request.
+## How AIRuntime Works with DRA: Step-by-Step Technical Execution
 
-This document explores approaches to solve this problem. We must find a secure way to pass the user's identity to the Control Plane during Web UI sessions. Identifying the user is a strict requirement to ensure accurate billing, security, and clear audit traces.
+The complete lifecycle of an AIRuntime from API call to active GPU execution follows these 7 distinct steps:
 
-The target access patterns are:
-- **CLI/SSH.** A developer runs commands or SSHs directly into the agent. 
-- **Web UI.** A user interacts with the OpenClaw or OpenCode sandbox proxy via a browser session.
+### Step 1: Request Validation, Capacity Hold, and Blueprint Submission (`airuntime-service`)
 
+1. **User Action & API Call:** The user submits a request from the UI to `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/airuntimes` specifying the runtime name, template ID, GPU hardware config ID, GPU count, region, plan ID, persistent storage size, and optional SSH keys.
+2. **Template & Container Image Resolution:** `airuntime-service` queries the database for the selected template (`s.queries.GetAIRuntimeTemplate`) to resolve the container image (`template.Image`), application ports (JupyterLab on port 8888), default environment variables, and any private registry credentials.
+3. **Authentication, Quotas, and Plan Verification:** Validates user JWT authentication, verifies project compute quotas, and ensures the billing `planId` matches the requested GPU hardware configuration.
+4. **Admission Capacity Hold (`inventory-service`):** Calls `inventoryClient.ReserveResources` to place a temporary 5-minute capacity hold in the database (`resource_reservations` table), preventing concurrent GPU VM or model deployment requests from taking the last GPU before this runtime is provisioned.
+5. **Database Record Creation:** Inserts a new row into the PostgreSQL `airuntimes` table with initial status `provisioning` and stores the reservation ID.
+6. **Build Blueprint (`AIRuntime` Custom Resource):** Calls `BuildAIRuntimeCR()` to assemble the `AIRuntime` CR (`ai.neevcloud.com/v1alpha1`) containing the target namespace, GPU specifications (model, VRAM, count), resolved container image, Ceph persistent storage configuration, and a randomly generated Jupyter password annotation.
+7. **Submit Blueprint to Workload Cluster (`k8sClient.Create`):** Posts the `AIRuntime` CR to the Workload Cluster API server via `k8sClient.Create(ctx, cr)`, handing off execution to the `airuntime-operator`.
 
-## Flow 1: API-key auto-resume
+---
 
-When a user interacts with a sandbox by providing an external API key (e.g., for SSH, Exec, or File Ops), the system will use the following approach to auto-resume the agent.
+### Step 2: Operator Creates Storage, GPU Claim, and Pod (`airuntime-operator`)
 
+When the `airuntime-operator` sees the new `AIRuntime` CR in the Kubernetes API server, it does three things:
 
-**Flow Details:**
-1. **Client Request:** A client (e.g., MCP router or SDK) sends a request to an **agent-backed sandbox** using an API key. This request hits the **sandbox-ingress-gateway** (an Envoy chain + forward proxy) in the Data Plane.
-2. **Authorize:** The gateway makes an `ext_authz` call to the **auth-service** for authorization and liveness checks (operating on a tight 250ms budget).
-3. **Upstream Routing:** If the agent is paused, the `auth-service` instructs the gateway to dynamically set the upstream destination to the **sandbox-activator**.
-4. **Forwarding:** The gateway forwards the original request to the `sandbox-activator`, which uses hold, single-flight, and forward logic.
-5. **CR Lookup:** The `sandbox-activator` queries the Kubernetes **Sandbox CR** (whose state is persisted in `etcd`) to check for the presence of the `agent-id` label.
-6. **CR Response:** The label status is returned to the activator.
-7. **Triggering CP:** The activator sends a resume request (passing along the caller's API key) through the **Istio internal gateway** (the DP-to-CP path secured with an internal CA) to the **aiagent-service** in the Control Plane. 
-   - **If `agent-id` is present:** It calls the `ResumeAgent` API.
-   - **If `agent-id` is missing:** It calls the standard `ResumeSandbox` API (returns **409 Conflict** if the sandbox is actually agent-backed).
-   The CP service evaluates API key scopes, validates funds, and processes snapshot and restore annotations to unpause the agent.
-8. **Holding & Proxying:** The activator holds the original request until the agent transitions to `Ready`. Once ready, it proxies the connection back to the **sandbox-ingress-gateway**.
-9. **Re-Authorization:** The gateway receives the proxied request and once again makes an `ext_authz` call to the **auth-service**. 
-10. **Final Routing:** Because the agent is now running, the auth-service allows the request and routes the traffic to `sandboxd` (port 44772) on the resumed agent.
-11. **Response:** The response is finally returned to the client.
+1. **Creates the Storage Mount (PVC):** If persistent storage is requested, it ensures a `PersistentVolumeClaim` is ready to mount at `/data/workspace` so user files are never lost.
+2. **Creates the GPU Request (`ResourceClaim`):** It submits a `ResourceClaim` to Kubernetes asking for the exact GPU needed:
+   ```
+   device.attributes['gpu.nvidia.com'].productName == 'NVIDIA GeForce RTX 5090' &&
+   device.capacity['gpu.nvidia.com'].memory.compareTo(quantity('31Gi')) >= 0
+   ```
+3. **Creates the Pod Object:** It creates the Pod in Kubernetes with container image (`pytorch-jupyter:v2.4`), storage mount (`/data/workspace`), and attaches the GPU `ResourceClaim`. *(The Pod is created in `Pending` state and does not run yet).*
 
-```mermaid
-flowchart LR
-    cl["client<br/>MCP router / SDK (api-key)"]:::store
+---
 
-    subgraph DP [Data Plane]
-        cr[("sandbox CR<br/>(k8s etcd)")]:::store
-        gw["sandbox-ingress-gateway<br/>Envoy chain + forward proxy"]:::dp
-        az["auth-service ext_authz<br/>authz + liveness (250ms budget)"]:::dp
-        act["sandbox-activator<br/>hold · single-flight · forward"]:::star
-        igw["Istio internal gateway<br/>TLS 443 · internal CA"]:::dp
-        sd["sandboxd :44772"]:::dp
-    end
+### Step 3: Scheduler Matches the Claim to a GPU Node (`kube-scheduler`)
 
-    subgraph CP [Control Plane]
-        cp["aiagent-service<br/>ResumeAgent OR ResumeSandbox<br/>api-key scope · funds · snapshot + restore annotations"]:::cp
-    end
+Once the Pod and its `ResourceClaim` are in Kubernetes, `kube-scheduler` handles the matching:
 
-    cl --->|"1 request to sb-abc"| gw
-    gw --->|"2 authorize"| az
-    az -..->|"3 suspended → instruct:<br/>upstream = activator"| gw
-    gw --->|"4 forward original request"| act
-    act --->|"5 check agent-id label"| cr
-    cr -..->|"6 returns label status"| act
-    act --->|"7 resume (caller's api-key)<br/>ResumeAgent if label exists<br/>ResumeSandbox if missing"| igw
-    igw ---> cp
-    act --->|"8 hold until Ready, then proxy"| gw
-    gw --->|"9 authorize (again)"| az
-    az -..->|"10 running (OK)"| gw
-    gw --->|"11 route to sandbox"| sd
-    sd -..->|"12 response"| gw
-    gw -..->|"13 response"| cl
+1. **Reads the Claim:** The scheduler sees the pending Pod asking for a GPU via its `ResourceClaim`.
+2. **Checks Node Hardware (`ResourceSlice`):** It checks the hardware catalog (`ResourceSlice`) published by all worker nodes to find a node that has a free card matching the GPU model and VRAM.
+3. **Locks the GPU:** It finds an available RTX 5090 (`gpu-0`) on `worker-3`, writes `worker-3, gpu-0` into `ResourceClaim.status.allocation`, and locks the card so no other workload can take it.
+4. **Places the Pod on the Node:** It binds the Pod to `worker-3` so the node can start preparing the hardware.
 
-    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
-    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
-    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
-    classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
-```
+---
 
-## Flow 2: Web UI auto-resume
+### Step 4: Node Hardware Preparation (`kubelet` & DRA Driver DaemonSet)
 
-When resuming an **agent-backed sandbox** via a Web UI, the browser uses a session Cookie. The challenge here is that the Auth Service validates and strips this Cookie before forwarding the request to the `sandbox-activator`. 
+Every GPU worker node in the cluster runs an **NVIDIA DRA driver DaemonSet pod** (the kubelet plugin) that directly interfaces with the node's PCIe hardware.
 
-Because the cookie is deleted at the edge, the `sandbox-activator` receives the request without any user identity. If the activator attempts to send a resume request to the Control Plane without these authentication fields, the request will be rejected.
+1. **Kubelet Receives the Pod:** The `kubelet` agent on `worker-3` sees that the Pod has been assigned to its node and recognizes that it requires a DRA resource (`gpu-claim`).
+2. **Local gRPC Call (`NodePrepareResources`):** `kubelet` connects to the local **NVIDIA DRA driver DaemonSet pod** running on that same node via a local UNIX socket and executes a `NodePrepareResources` gRPC call.
+3. **Hardware Reset & CDI File Generation:** 
+   * The NVIDIA DRA driver daemon on `worker-3` validates physical `gpu-0`, inspects its hardware address, and clears any leftover memory from prior workloads.
+   * The driver then writes the **CDI (Container Device Interface) JSON file** directly to the host filesystem at `/var/run/cdi/nvidia.com-gpu.json`:
+     ```json
+     {
+       "cdiVersion": "0.5.0",
+       "kind": "nvidia.com/gpu",
+       "devices": [
+         {
+           "name": "gpu-0",
+           "containerEdits": {
+             "deviceNodes": [
+               {"path": "/dev/nvidia0", "hostPath": "/dev/nvidia0"},
+               {"path": "/dev/nvidiactl", "hostPath": "/dev/nvidiactl"},
+               {"path": "/dev/nvidia-uvm", "hostPath": "/dev/nvidia-uvm"},
+               {"path": "/dev/nvidia-uvm-tools", "hostPath": "/dev/nvidia-uvm-tools"}
+             ],
+             "mounts": [
+               {
+                 "hostPath": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+                 "containerPath": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+                 "options": ["ro", "nosuid", "nodev", "bind"]
+               }
+             ]
+           }
+         }
+       ]
+     }
+     ```
+   * This JSON file is the concrete instruction sheet that tells `containerd` exactly which `/dev/` files to create and which driver libraries to attach to the container.
 
-To resolve this identity propagation issue, the following architecture defines how to securely pass the user's identity to the Control Plane.
+---
 
-### Auth Service Internal JWT Minting
+### Step 5: Container Device Attachment and Process Launch (`containerd` & CDI)
 
-The `auth-service` acts as a token-exchange layer, minting a secure internal JWT that the Control Plane can natively validate to authenticate the user.
+The Pod is now on `worker-3`, and the NVIDIA driver has prepared the CDI instructions file. Next, `containerd` starts the container to run the user's requested workload (e.g., PyTorch + JupyterLab).
 
-**How it works:**
-1. The **sandbox-ingress-gateway** receives the Web UI request and triggers `ext_authz` on the **auth-service**.
-2. The `auth-service` validates the session cookie, extracts the user ID, and **mints a narrow, single-purpose internal JWT** (resume token). 
-3. The `auth-service` injects this JWT into a custom header named `X-Neev-Resume-Token`. It explicitly avoids using the standard `Authorization` header so it doesn't accidentally overwrite or erase passwords needed by web apps running inside the user's sandbox (like Code Server). The `auth-service` also leaves the user's original session cookie attached to the request.
-4. The gateway routes the suspended request to the `sandbox-activator`.
-5. The activator extracts the `X-Neev-Resume-Token`, forwards the Resume request (passing the token) to the **aiagent-service** (Control Plane) to unpause the agent, and drops the token. Its single-flight key is based on `sandbox_id` plus user, rather than the raw token.
-6. The activator holds the user's original HTTP connection open while it waits for the agent Pod to become `Ready`.
-7. Once `Ready`, the activator proxies the connection (with the original session cookie still attached) back to the **sandbox-ingress-gateway**.
-8. The gateway runs `ext_authz` again. Because the cookie was preserved, this functions as an ordinary cookie validation. The **auth-service** validates the request and issues an instruction to the gateway to remove the session cookie and any `X-Neev-Resume-Token` headers. The gateway then executes this instruction, physically stripping the headers before routing the final traffic to the untrusted `sandboxd` container.
+By default, a container is isolated and cannot see or access the physical GPU on the host server. To connect the GPU to this container, `containerd` reads the CDI file (`/var/run/cdi/nvidia.com-gpu.json`) and unlocks the **operating system gates**:
 
-```mermaid
-flowchart LR
-    cl["browser<br/>Web UI Session (cookie)"]:::store
+1. **Gate 1: Creating the Device Files inside the Pod's `/dev/` Directory:**
+   * In Linux, **every piece of hardware is represented as a file** inside the `/dev/` directory (for example, `/dev/sda` for a disk).
+   * By default, a Pod's container has its own private `/dev/` folder with **zero GPU files**. If PyTorch looks for a GPU, it finds nothing and throws an error: `No CUDA GPUs are available`.
+   * **Only the Requested GPU is Added (Strict Isolation):**
+     * If the host node has 8 physical GPUs (`gpu-0` through `gpu-7`) and you requested **1 GPU**, the CDI file contains **ONLY** the data for that single assigned GPU (`gpu-0`).
+     * It does **NOT** include any other GPUs on the node. The other 7 cards (`/dev/nvidia1` through `/dev/nvidia7`) do not exist inside your container and are completely invisible.
+   * `containerd` reads the CDI file and injects only the requested card's files directly into the Pod's private `/dev/` directory:
+     * **`/dev/nvidia0`**: The direct data pipeline to physical GPU 0. PyTorch writes to this file to send AI models, weights, and CUDA calculation instructions.
+     * **`/dev/nvidiactl`**: The master control switch used to initialize the card, power it up, and check temperature and clock speeds.
+     * **`/dev/nvidia-uvm`**: Unified Virtual Memory file that allows CPU RAM and GPU VRAM to share data directly.
+     * **`/dev/nvidia-uvm-tools`**: Profiling interface used by performance monitoring tools (like PyTorch Profiler).
 
-    subgraph DP [Data Plane]
-        gw["sandbox-ingress-gateway<br/>Envoy chain + forward proxy"]:::dp
-        az["auth-service ext_authz<br/>validate cookie + mint internal JWT"]:::dp
-        act["sandbox-activator<br/>hold · single-flight · proxy"]:::star
-        igw["Istio internal gateway<br/>TLS 443 · internal CA"]:::dp
-        sd["sandboxd :44772"]:::dp
-    end
+2. **Gate 2: Device Security Filter (Cgroups v2):**
+   * Even with the files in `/dev/`, the Linux kernel blocks unauthorized hardware access by default.
+   * `containerd` sets a security rule that **allows access ONLY to GPU 0** (`gpu-0`). Access to all other GPUs on the machine is strictly blocked.
+   * This ensures your container can only use its assigned card and cannot touch any other user's GPU on the server.
 
-    subgraph CP [Control Plane]
-        cp["aiagent-service ResumeAgent<br/>validates JWT · user-id scope"]:::cp
-    end
+3. **Storage Mount:**
+   * If persistent storage was requested, `containerd` mounts the Ceph PVC to `/data/workspace`.
 
-    cl --->|"1 GET / (cookie)"| gw
-    gw --->|"2 authorize"| az
-    az -..->|"3 suspended → instruct:<br/>keep cookie, inject resume token,<br/>upstream = activator"| gw
-    gw --->|"4 forward req (cookie + resume token)"| act
-    act --->|"5 resume (pass token, drop it)"| igw
-    igw ---> cp
-    cp -..->|"6 Agent awakened"| igw
-    igw -..->|"7 Return success"| act
-    act --->|"8 hold until Ready, proxy (cookie)"| gw
-    gw --->|"9 authorize (cookie pass)"| az
-    az -..->|"10 OK → instruct:<br/>strip cookie & resume token"| gw
-    gw --->|"11 strip headers & route to sandbox"| sd
-    sd -..->|"12 response"| gw
-    gw -..->|"13 response"| cl
+4. **Container Entrypoint Execution:**
+   * With device nodes injected, security filters set, and storage mounted, `containerd` executes the container entrypoint process:
+     ```bash
+     jupyter lab --ip 0.0.0.0 --port 8888
+     ```
+   * The Pod officially transitions from `Pending` to **`Running`**.
 
-    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
-    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
-    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
-    classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
-```
+---
 
-### Token Design
+### Step 6: Interactive Access Routing
 
-To securely propagate user identity to the Control Plane, the `auth-service` will generate a short-lived internal JWT with the following specifications:
+1. The container entrypoint executes JupyterLab on internal port `8888`.
+2. `airuntime-operator` creates an HTTP route via the Gateway API exposing `https://.../jupyter` secured by `JUPYTER_PASSWORD`.
+3. If SSH access was requested, the operator configures SSHPiper to proxy SSH connections to the pod's IP using tenant SSH public keys.
+4. The user connects via their browser and executes CUDA code on the bare-metal GPU.
 
+---
 
+### Step 7: Release on Stop (`reconcileStop`)
 
-1. **Key management and signing**
-   - The token uses asymmetric signing. To support this, we must generate a dedicated key pair and configure the **Internal Private Key in the Data Plane** (`auth-service`) to mint tokens, and the **Internal Public Key in the Control Plane** (`aiagent-service`) to verify them.
-   - **Why not reuse the existing HMAC secret?** We cannot reuse the existing `UI_SESSION_KEY` because it creates a massive security vulnerability. If a hacker breaches the Data Plane and steals this master secret, they could forge global user tokens, gain unauthorized access to the Control Plane, and wake or control any agent in the entire platform. Using a dedicated asymmetric key prevents a compromised Data Plane from forging full-access user tokens.
-   - **Performance:** Generating this token in the `auth-service` is extremely fast (typically **< 1-2 milliseconds**). This ensures that the token minting process easily fits within the strict 250ms latency budget allocated for the `ext_authz` call.
-2. **Token Payload (Claims)**
-   - **Identity:** Must include `sub` (user ID), `org_id`, `project_id`, `sandbox_id`, `agent_id`, and `plan_id`.
-   - **Metadata:** Must include `aud` (`aiagent-service`), `iss` (`auth-service` with region), `exp` (expiration), `jti` (unique identifier), and `scope=resume`.
-3. **Token Lifetime and Scope**
-   - The token enforces a strict 120-second TTL (`exp`). This window accommodates network propagation and subsequent agent boot times while minimizing the risk of token leakage.
-   - The token is strictly single-purpose and scoped to the target sandbox. 
-   - Replay attacks are mitigated by tracking the unique `jti` claim on the Control Plane to enforce single-use semantics.
-4. **User ID Source**
-   - The `auth-service` extracts the User ID directly from the user's `uisession` cookie.
-5. **Control Plane Validation**
-   - The Control Plane must be updated to validate the internal JWT using the trusted public keys. Once authenticated, the existing authorization pipeline will automatically enforce standard checks (e.g., billing, permissions), exactly as it currently does for standard UI tokens.
+1. When the user stops the AIRuntime, `airuntime-controller` triggers `reconcileStop`:
+   * Deletes the Deployment / Pod.
+   * Deletes the `ResourceClaim`.
+   * Deleting the claim releases the device lock on `gpu-0`, making it immediately free for other users in the cluster.
+   * The PVC and `AIRuntime` custom resource are preserved, ensuring all files, notebooks, and checkpoints are safely kept.
 
 
-## Security
-- The internal JWT (resume token) minted by `auth-service` is strictly short-lived and only valid for internal service-to-service communication.
-- The `X-Neev-Resume-Token` header and the raw session cookie are strictly stripped by the gateway before requests are finally routed into the untrusted `sandboxd` environment.
-
-## Rejected Alternatives
-
-| Approach | Concept | Reason for Rejection |
-| :--- | :--- | :--- |
-| **Auth Service Header Injection** | `auth-service` validates and strips cookie, injecting an `X-Neev-User-ID: <uuid>` plain-text header. Activator forwards this User ID header to the CP. | **CP Validation Failure:** The Control Plane authenticates requests using API Keys or JWTs. It will reject the request because it cannot authorize actions based purely on a plain-text User ID. |
-| **Server API Key Bypass** | Activator bypasses user validation by injecting a master `Server API Key` to authenticate the Resume request against the CP. | **Breaks Tracing & Billing:** While this bypasses CP validation, it destroys user-level tracing and accurate billing attribution. The Control Plane logs the action under the Server identity, completely losing the identity of the user who initiated the resume. |
-| **Authorization Header Overwrite** | `auth-service` injects the internal JWT into the `Authorization` header instead of a custom header. | **Breaks Sandbox Apps:** Web applications running inside the user's sandbox (e.g., Code Server) may rely on their own `Authorization` headers. Overwriting or stripping this header at the edge breaks native application functionality. |
